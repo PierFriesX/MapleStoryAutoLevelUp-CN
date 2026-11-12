@@ -29,6 +29,7 @@ SECTION_CN = {
     "route_recoder": "路线录制器",
     "game_window": "游戏窗口",
     "system": "系统设置",
+    "humanize": "挂机节奏",
 }
 
 # 通用字段名（所有分组共用）

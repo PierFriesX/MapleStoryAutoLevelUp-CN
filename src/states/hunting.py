@@ -32,6 +32,10 @@ class HuntingState(State):
         if self.bot.is_player_stuck():
             self.bot.handle_stuck()
 
+        # 平地偶尔站住、段尾先站一会。梯子 / 跳跃 / 回正 / 出招过程里它会让路。
+        if hasattr(self.bot, "apply_human_pace"):
+            self.bot.apply_human_pace()
+
         # send command to keyboard controller
         self.bot.kb.set_command(self.bot.cmd_move_x + ' ' + \
                                 self.bot.cmd_move_y + ' ' + \

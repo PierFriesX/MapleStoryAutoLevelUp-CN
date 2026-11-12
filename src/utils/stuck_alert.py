@@ -168,6 +168,36 @@ def _build_text(pos=None, seconds=None, cmd=None, extra: str = "") -> str:
     return "\n".join(lines)
 
 
+def notify_user(title: str, text: str, cooldown: float = 30.0,
+                log_prefix: str = "[提示]") -> bool:
+    '''置顶提示（不抢游戏焦点）。和卡死告警共用同一扇窗，避免叠两个框。
+
+    非 Windows 只写日志。弹窗失败不往外抛。
+    '''
+    global _popup_open, _t_last_popup
+    try:
+        logger.warning(f"{log_prefix} " + str(text).replace("\n", " | "))
+    except Exception:                                # noqa: BLE001
+        pass
+    if sys.platform != "win32":
+        return False
+    with _lock:
+        if _popup_open:
+            return False
+        if time.time() - _t_last_popup < float(cooldown):
+            return False
+        _popup_open = True
+    try:
+        threading.Thread(target=_popup_worker, args=(str(title), str(text)),
+                         daemon=True).start()
+        return True
+    except Exception as e:                           # noqa: BLE001
+        logger.warning(f"{log_prefix} 起弹窗线程失败（只留日志）：{e}")
+        with _lock:
+            _popup_open = False
+        return False
+
+
 def notify_stuck(pos=None, seconds=None, cmd=None, extra: str = "",
                  cooldown: float = 60.0) -> bool:
     '''卡死告警：打一条醒目日志，并按需弹一个**置顶**窗口。

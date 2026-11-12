@@ -39,6 +39,9 @@ config/config_data.yaml
 nametag/*.png
 nametag/*.jpg
 
+# 用户自己截的反挂机验证小图（可能含账号界面）
+antimacro/*.png
+
 # 个人录制的路线与模板（会暴露挂机点位/怪物分布，默认不公开）
 
 # 内部工作流文档（架构/PRD 设计稿、调研报告、交接材料）：

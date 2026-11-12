@@ -66,6 +66,7 @@ ADV_SETTINGS_HIDE = [
     'game_window',          # 窗口标题 / 尺寸  -> 同上
     'system',               # 线程帧率 / 语言  -> 底层性能参数
     'watchdog',             # 看门狗参数      -> 卡死判定阈值，默认值即可
+    'humanize',             # 挂机节奏        -> 配置文件 humanize 段
     # 🧪 'bars' 2026-09-27 加：血条/蓝条识别参数（roi / span / HSV）
     #    这些是**开发期在真机上量出来的**，不是调参项 —— 用户改只会把读数搞错，
     #    而且改错了的症状是"血满着疯狂喝药"或"永远读不到"，很难联想到是这里。
@@ -2774,6 +2775,19 @@ class MainWindow(QMainWindow):
                     "　起点开始走 → 中途要折返就按一次分段 → "
                     "**走到终点按 F3 保存**（这一步才会盖上终点标记）。\n\n"
                     "日志区里有 `[路线校验]` 打出的具体原因，照着看更准。")
+                box.exec_()
+            elif ret == -4:
+                self.button_start_pause.setChecked(False)
+                self.button_start_pause.setText("▶ 开始 (F1)")
+                self.button_start_pause.setStyleSheet("")
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Information)
+                box.setWindowTitle("这一段先休息")
+                box.setText(getattr(self.controller, "rest_problem", "")
+                            or "上一段挂机刚结束，先休息一会再开始。")
+                box.setInformativeText(
+                    "休息是挂机节奏的一部分。想马上继续，"
+                    "把配置里的 humanize.enable 改成 false。")
                 box.exec_()
             else:
                 # Start failed

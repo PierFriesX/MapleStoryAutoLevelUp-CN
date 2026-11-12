@@ -196,6 +196,22 @@ class MapleStoryAutoBot:
         self.n_potion_drunk = 0     # 本次运行累计喝了几次（给界面显示）
         self.t_last_bars_log = time.time()  # 血蓝读数日志节流（每 5 秒一行）
 
+        # ── 挂机节奏（src/utils/humanize.py）────────────────────────────────
+        # 配置段缺了就当关掉。这些字段给「出手延迟 / 放过一拨怪 / 站一会 /
+        # 一段打完就停」记账，具体判定都在纯函数里。
+        self._human_rng = random.Random()
+        self._atk_phase = "idle"       # idle / wait / skip / commit
+        self._react_until = 0.0
+        self._attack_cd_need = None    # None = 用配置里的原始冷却
+        self._session_start = 0.0
+        self._session_limit = None     # None = 不限时
+        self._session_finished = False
+        self._dwell_until = 0.0
+        self._next_dwell_roll = 0.0
+        self._antimacro = []           # [(文件名, 灰度模板)]
+        self._macro_latched = False
+        self._macro_tick = 0
+
         # 上一帧**实际发出**的左右指令（2026-09-12 加）
         # ⚠️ 为什么需要它：出招必须**先转身再按技能键**，否则技能会朝旧朝向飞出去，
         #    表现就是「后方的怪打不到」。上游 config 里躺着 character_turn_delay: 0.02，
@@ -692,6 +708,7 @@ class MapleStoryAutoBot:
         self.cfg = cfg
         # 先校验配置完整性（缺键会让主循环在运行中静默崩溃，见 _check_cfg_completeness）
         self._check_cfg_completeness(cfg)
+        self._load_antimacro()
 
         # ── ⚠️★ 2026-09-28 存量配置自动纠正：white_mask → grayscale ──────────
         #   v1.0.11 曾把默认（及标定工具写入的）mode 改成 white_mask，那是一次
@@ -1076,6 +1093,12 @@ class MapleStoryAutoBot:
         self.t_watch_dog = time.time()
         self.t_last_attack = time.time()
         self.t_last_minimap_update = time.time()
+        self._attack_cd_need = None
+        self._atk_phase = "idle"
+        self._react_until = 0.0
+        self._session_finished = False
+        self._macro_latched = False
+        self._begin_human_session()
 
         # Set init state
         if self.args.init_state != "":
@@ -3500,6 +3523,9 @@ class MapleStoryAutoBot:
             if self.cmd_action == "goal":
                 self.route_reverse = True
                 self.cmd_action = "none"
+                _dwell = getattr(self, "_maybe_turnaround_dwell", None)
+                if _dwell:
+                    _dwell()
                 logger.info("[巡逻] 单段路线已到终点 → 掉头往回走")
             return
 
@@ -3517,6 +3543,9 @@ class MapleStoryAutoBot:
              + abs(self.loc_player_global[1] - self._pingpong_start[1]))
         if d <= turn_range:
             self.route_reverse = False
+            _dwell = getattr(self, "_maybe_turnaround_dwell", None)
+            if _dwell:
+                _dwell()
             logger.info(f"[巡逻] 单段路线已回到起点（{d}px）→ 掉头继续正走")
 
     # ── 平台边缘**硬**保护（2026-09-13 用户点名要的功能）────────────────────
@@ -4368,7 +4397,292 @@ class MapleStoryAutoBot:
             f"指令({self.cmd_move_x} {self.cmd_move_y} {self.cmd_action})"
             + (f"，距上次 {gap:.2f}s" if gap is not None else ""))
 
+    def _human_params(self):
+        from src.utils.humanize import params
+        return params(getattr(self, "cfg", None))
+
+    def _human_on(self):
+        return bool(self._human_params().get("enable"))
+
+    def _hrng(self):
+        rng = getattr(self, "_human_rng", None)
+        if rng is None:
+            rng = random.Random()
+            self._human_rng = rng
+        return rng
+
+    def _load_antimacro(self):
+        '''读 antimacro/*.png。没有文件就只记一行，不检测。'''
+        self._antimacro = []
+        folder = resource_path("antimacro")
+        if not os.path.isdir(folder):
+            logger.info(
+                "[节奏] 没有 antimacro/ 目录，反挂机验证出现时不会自动停手。"
+                "把验证窗截一小块放进这个目录即可。")
+            return
+        paths = sorted(glob.glob(os.path.join(folder, "*.png")))
+        for path in paths:
+            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            if img is None or img.size == 0:
+                logger.warning(f"[节奏] 验证模板读不了，已跳过：{os.path.basename(path)}")
+                continue
+            self._antimacro.append((os.path.basename(path), img))
+        if self._antimacro:
+            logger.info(f"[节奏] 已载入 {len(self._antimacro)} 张反挂机验证模板")
+        else:
+            logger.info(
+                "[节奏] antimacro/ 里没有 png，反挂机验证出现时不会自动停手。"
+                "截验证窗的一小块（不要整屏）放进去。")
+
+    def _begin_human_session(self):
+        '''开跑时抽本段时长，多段路线时随机从某一段起步。'''
+        from src.utils.humanize import session_span, uniform_span
+        p = self._human_params()
+        self._session_start = time.time()
+        self._session_limit = None
+        self._session_finished = False
+        self._dwell_until = 0.0
+        if not p["enable"]:
+            return
+        routes = getattr(self, "img_routes", None) or []
+        if len(routes) > 1:
+            self.idx_routes = self._hrng().randrange(len(routes))
+            logger.info(
+                f"[节奏] 本段从第 {self.idx_routes + 1}/{len(routes)} 段路线开始")
+        limit = session_span(p, self._hrng())
+        self._session_limit = limit
+        self._next_dwell_roll = time.time() + uniform_span(
+            p["dwell_every_min_sec"], p["dwell_every_max_sec"], self._hrng())
+        if limit:
+            logger.info(
+                f"[节奏] 已开启。本段大约 {limit / 60.0:.0f} 分钟后回城并休息，"
+                f"攻击和增益间隔会抖动，出手会晚零点几秒。")
+        else:
+            logger.info("[节奏] 已开启，但 session_max_sec<=0，本段不限时。")
+
+    def _attack_interval_ready(self, base_cd):
+        need = base_cd
+        if self._human_on():
+            rolled = getattr(self, "_attack_cd_need", None)
+            if rolled:
+                need = rolled
+        return time.time() - self.t_last_attack > need
+
+    def _note_attack_fired(self, base_cd):
+        from src.utils.humanize import jitter_interval
+        self.t_last_attack = time.time()
+        self._atk_phase = "idle"
+        self._react_until = 0.0
+        if not self._human_on():
+            self._attack_cd_need = None
+            return
+        self._attack_cd_need = jitter_interval(
+            base_cd, self._human_params()["attack_jitter"], self._hrng())
+
+    def _human_attack_allowed(self, base_cd, dx, dy):
+        '''节奏关掉时永远放行，原来的冷却判断照旧。'''
+        if not self._human_on():
+            return True
+        from src.utils.humanize import decide_attack, is_edge_target
+        p = self._human_params()
+        prev = getattr(self, "_atk_phase", "idle")
+        edge = is_edge_target(
+            self.monsters, self.loc_player, dx, dy, p["edge_ratio"])
+        allow, phase, react = decide_attack(
+            prev, time.time(), self._attack_interval_ready(base_cd),
+            getattr(self, "_react_until", 0.0), edge,
+            p["attack_skip_prob"], p["edge_skip_prob"],
+            p["react_min_sec"], p["react_max_sec"], self._hrng(),
+            p["skip_min_sec"], p["skip_max_sec"])
+        self._atk_phase = phase
+        self._react_until = react
+        if phase == "skip" and prev != "skip":
+            logger.info("[节奏] 这拨怪放过去，继续沿路线走")
+        elif phase == "wait" and prev != "wait":
+            logger.debug("[节奏] 看到怪了，晚一点再出手")
+        return allow
+
+    def _maybe_turnaround_dwell(self):
+        if not self._human_on():
+            return
+        from src.utils.humanize import turnaround_dwell
+        p = self._human_params()
+        dur = turnaround_dwell(
+            p["turnaround_dwell_prob"],
+            p["turnaround_dwell_min_sec"],
+            p["turnaround_dwell_max_sec"],
+            self._hrng())
+        if dur > 0:
+            self._dwell_until = time.time() + dur
+
+    def _pace_safe(self):
+        '''站一会只会落在平地直行上。梯子、跳跃、回正、出招过程都不打断。'''
+        if getattr(self, "is_using_home_route", False):
+            return False
+        if getattr(self, "is_on_ladder", False):
+            return False
+        if getattr(self, "_atk_phase", "idle") != "idle":
+            return False
+        if int(getattr(self, "_turn_frames_left", 0) or 0) > 0:
+            return False
+        if getattr(self, "cmd_move_y", "none") != "none":
+            return False
+        if getattr(self, "cmd_action", "none") not in ("none", "goal"):
+            return False
+        return True
+
+    def apply_human_pace(self):
+        '''平地偶尔站住，或兑现掉头时排好的停留。不安全就让路给原来的指令。'''
+        if not self._human_on():
+            return
+        from src.utils.humanize import uniform_span
+        now = time.time()
+        if now < float(getattr(self, "_dwell_until", 0.0) or 0.0):
+            if self._pace_safe():
+                self.cmd_move_x = "none"
+                self.cmd_move_y = "none"
+                self.cmd_action = "none"
+            return
+        if not self._pace_safe():
+            return
+        nxt = float(getattr(self, "_next_dwell_roll", 0.0) or 0.0)
+        if nxt <= 0 or now < nxt:
+            return
+        p = self._human_params()
+        self._next_dwell_roll = now + uniform_span(
+            p["dwell_every_min_sec"], p["dwell_every_max_sec"], self._hrng())
+        if self._hrng().random() >= float(p["dwell_prob"]):
+            return
+        dur = uniform_span(p["dwell_min_sec"], p["dwell_max_sec"], self._hrng())
+        if dur <= 0:
+            return
+        self._dwell_until = now + dur
+        self.cmd_move_x = "none"
+        self.cmd_move_y = "none"
+        self.cmd_action = "none"
+
+    def _human_status_suffix(self):
+        if not self._human_on():
+            return ""
+        limit = getattr(self, "_session_limit", None)
+        start = getattr(self, "_session_start", 0) or 0
+        if not limit or start <= 0:
+            return " 节奏开"
+        left = max(0, int(float(limit) - (time.time() - start)))
+        return f" 节奏开 本段剩{left}s"
+
+    def _session_due(self):
+        if not self._human_on() or getattr(self, "_session_finished", False):
+            return False
+        limit = getattr(self, "_session_limit", None)
+        start = getattr(self, "_session_start", 0.0) or 0.0
+        if not limit or start <= 0:
+            return False
+        return time.time() - start >= float(limit)
+
+    def _finish_session(self):
+        '''到点：松键、回城、写下休息截止时间、停主循环。'''
+        if getattr(self, "_session_finished", False):
+            return
+        self._session_finished = True
+        from src.utils.humanize import uniform_span, write_rest
+        from src.utils.paths import ensure_parent
+        from src.utils.stuck_alert import notify_user
+        p = self._human_params()
+        rest = uniform_span(p["rest_min_sec"], p["rest_max_sec"], self._hrng())
+        until = time.time() + rest
+        try:
+            write_rest(ensure_parent("log/humanize_rest.json"), until, "session")
+        except Exception as e:                                   # noqa: BLE001
+            logger.warning(f"[节奏] 休息时间没写下来：{e}")
+        try:
+            if self.kb is not None:
+                self.kb.set_command("none none none")
+                self.kb.release_all_key()
+        except Exception:                                        # noqa: BLE001
+            pass
+        key = (self.cfg.get("key", {}) or {}).get("return_home") or ""
+        if key and not getattr(self, "is_disable_control", False):
+            press_key(key)
+            logger.info(f"[节奏] 本段时间到，已按回城键 {key!r}")
+        else:
+            logger.info("[节奏] 本段时间到，没有回城键，直接停止")
+        mins = max(1, int(round(rest / 60.0)))
+        played = 0.0
+        if getattr(self, "_session_start", 0):
+            played = (time.time() - self._session_start) / 60.0
+        notify_user(
+            "挂机引擎：这一段结束了",
+            f"这一段大约打了 {played:.0f} 分钟，已经停止。\n\n"
+            f"接下来休息约 {mins} 分钟。休息结束前再点开始会被拦住。\n"
+            "下次建议换一张图，或换一条路线。\n\n"
+            "如果按钮还显示「暂停」，点一下让它回到「开始」。",
+            cooldown=1.0,
+            log_prefix="[节奏]",
+        )
+        self.is_terminated = True
+        if self.kb is not None:
+            self.kb.is_terminated = True
+
+    def _scan_antimacro(self):
+        '''对上验证模板就松键并停。不点验证。返回 True 表示本帧到此为止。'''
+        templates = getattr(self, "_antimacro", None) or []
+        if not templates or getattr(self, "_macro_latched", False):
+            return False
+        every = int(self._human_params().get("antimacro_every") or 8)
+        tick = int(getattr(self, "_macro_tick", 0) or 0) + 1
+        self._macro_tick = tick
+        if tick % max(1, every) != 0:
+            return False
+        gray = getattr(self, "img_frame_gray", None)
+        if gray is None:
+            return False
+        try:
+            from src.utils.humanize import match_antimacro
+            hit = match_antimacro(
+                gray, templates, self._human_params()["antimacro_thres"])
+        except Exception as e:                                   # noqa: BLE001
+            logger.warning(f"[节奏] 验证画面检测失败（本帧跳过）：{e}")
+            return False
+        if hit is None:
+            return False
+        self._macro_latched = True
+        name, score = hit
+        logger.warning(
+            f"[节奏] 画面对上验证模板 {name}（分数 {score:.3f}），"
+            "松开按键并停止。请自己完成验证后再点开始。")
+        try:
+            if self.kb is not None:
+                self.kb.set_command("none none none")
+                self.kb.release_all_key()
+        except Exception:                                        # noqa: BLE001
+            pass
+        from src.utils.stuck_alert import notify_user
+        notify_user(
+            "挂机引擎：出现验证了",
+            "画面上出现了反挂机验证，挂机已经停下，按键也松开了。\n\n"
+            "请自己在游戏里把验证做完，再回到这个窗口点开始。\n"
+            "脚本不会替你点验证。\n\n"
+            "如果按钮还显示「暂停」，点一下让它回到「开始」。",
+            cooldown=1.0,
+            log_prefix="[节奏]",
+        )
+        self.is_terminated = True
+        if self.kb is not None:
+            self.kb.is_terminated = True
+        return True
+
     def update_cmd_by_mob_detection(self):
+        # 离线桩只把本函数绑到 Stub 上，没有节奏方法。缺了就退回「冷却一到就打」。
+        if not hasattr(self, "_human_attack_allowed"):
+            self._human_attack_allowed = lambda *a, **k: True
+        if not hasattr(self, "_attack_interval_ready"):
+            self._attack_interval_ready = (
+                lambda cd: time.time() - self.t_last_attack > cd)
+        if not hasattr(self, "_note_attack_fired"):
+            self._note_attack_fired = (
+                lambda cd: setattr(self, "t_last_attack", time.time()))
+
         # Get monster search box
         margin = self.cfg["monster_detect"]["search_box_margin"]
         if self.cfg["bot"]["attack"] == "aoe_skill":
@@ -4430,11 +4744,19 @@ class MapleStoryAutoBot:
             # 但回正线接不上、或路线走到 goal 时它不会覆盖，这颗雷就会响 —— 所以必须清。
             if self.cmd_action == "attack":
                 self.cmd_action = "none"
+            # 怪离开攻击框：上一拨「放过 / 等反应」作废，下一拨重新抽
+            self._atk_phase = "idle"
+            self._react_until = 0.0
+            return
+
+        if not self._human_attack_allowed(cooldown, dx, dy):
+            if self.cmd_action == "attack":
+                self.cmd_action = "none"
             return
 
         # Update attack command
         if self.cfg["bot"]["attack"] == "aoe_skill":
-            if time.time() - self.t_last_attack > cooldown:
+            if self._attack_interval_ready(cooldown):
                 # AOE 技能本身不分方向，但仍然要**面向**最近的怪：
                 # 上游在这里完全不设 cmd_move_x，角色永远保持初始朝向，
                 # 用户实测「后方的怪打不到」。AOE 不需要等转身，同帧出招即可。
@@ -4444,7 +4766,7 @@ class MapleStoryAutoBot:
                     if face is not None and self.cmd_move_x_last != face:
                         self.cmd_move_x = face
                 self.cmd_action = "attack"
-                self.t_last_attack = time.time()
+                self._note_attack_fired(cooldown)
 
         elif self.cfg["bot"]["attack"] == "directional":
             # Get nearest monster to player
@@ -4459,7 +4781,7 @@ class MapleStoryAutoBot:
                     self.cmd_action = "none"
                 return
             # Attack Command
-            if time.time() - self.t_last_attack > cooldown:
+            if self._attack_interval_ready(cooldown):
                 # ⚠️ 先转身、再出招（2026-09-12 修）
                 # 技能是朝**当前朝向**打出去的；同一帧按方向键+技能键，技能会朝旧朝向
                 # 飞走 —— 后方的怪永远打不到。上游 config 里躺着 character_turn_delay,
@@ -4475,7 +4797,7 @@ class MapleStoryAutoBot:
                 #    梯子上照常打怪，只是不改朝向。
                 if self.is_on_ladder:
                     self.cmd_action = "attack"
-                    self.t_last_attack = time.time()
+                    self._note_attack_fired(cooldown)
                     return
                 # ── 转身状态机（2026-09-17 重写）────────────────────────────
                 # 旧实现只有两步：① 朝向不对 → 本帧只发方向键；② 下一帧就出招。
@@ -4542,7 +4864,7 @@ class MapleStoryAutoBot:
                     self._turn_pending_dir = None
                 self.cmd_action = "attack"
                 self.cmd_move_x = "none"
-                self.t_last_attack = time.time()
+                self._note_attack_fired(cooldown)
 
     def update_cmd_by_random(self):
         '''
@@ -4631,6 +4953,9 @@ class MapleStoryAutoBot:
         # Switch to next route map
         self.idx_routes = (self.idx_routes+1)%len(self.img_routes)
         self.route_reverse = False     # 换段了，往返方向要复位
+        _dwell = getattr(self, "_maybe_turnaround_dwell", None)
+        if _dwell:
+            _dwell()
         logger.debug(f"Change to new route:{self.idx_routes}")
 
     def run_once(self):
@@ -4658,6 +4983,9 @@ class MapleStoryAutoBot:
 
         # Grayscale game window
         self.img_frame_gray = cv2.cvtColor(self.img_frame, cv2.COLOR_BGR2GRAY)
+
+        if self._scan_antimacro():
+            return 0
 
         # Image for debug viz - use the cropped (client area) frame
         if self.is_show_debug_window:
@@ -4916,7 +5244,8 @@ class MapleStoryAutoBot:
                 f"{' 回正' if self.is_using_home_route else ''}"
                 f" 指令({self.cmd_move_x} {self.cmd_move_y} {self.cmd_action})"
                 f" 怪{len(self.monsters)}"
-                f" 名字命中{self.nametag_hit}(miss{self.nametag_miss_streak})")
+                f" 名字命中{self.nametag_hit}(miss{self.nametag_miss_streak})"
+                f"{self._human_status_suffix()}")
 
         # ── 性能埋点：紧跟 [运行状态]，同样每 5 秒一条 ─────────────────
         # 位置有讲究：必须在「关掉可视化就提前 return」**之前** —— 这次排查
@@ -5035,6 +5364,10 @@ class MapleStoryAutoBot:
         time.sleep(0.3)
 
         while not self.kb.is_terminated:
+
+            if self._session_due():
+                self._finish_session()
+                break
 
             t_start = time.time()
             # ── 性能埋点：帧间隔（**含限帧 sleep**）与本窗口帧数 ──────────

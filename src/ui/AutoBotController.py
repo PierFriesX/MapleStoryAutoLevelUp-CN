@@ -165,6 +165,22 @@ class AutoBotController(QObject):
                 f"（收尾会自动盖上 goal 标记）。")
             return -3   # 与"驱动不可用(-2)"区分开，界面据此弹"没有可用路线"
 
+        # 上一段到点之后的休息窗。节奏关掉时不拦。
+        from src.utils.humanize import (
+            format_rest_block, params as human_params, read_rest, rest_remaining)
+        from src.utils.paths import resource_path
+        import time as _time
+        if human_params(cfg).get("enable"):
+            left = rest_remaining(
+                read_rest(resource_path("log/humanize_rest.json")), _time.time())
+            if left > 0:
+                self.rest_problem = format_rest_block(left)
+                logger.warning(
+                    "[start_bot] 还在休息，已阻止启动。\n"
+                    + "\n".join("        " + ln
+                                for ln in self.rest_problem.splitlines()))
+                return -4
+
         # Start the bot engine
         try:
             self.auto_bot.start()

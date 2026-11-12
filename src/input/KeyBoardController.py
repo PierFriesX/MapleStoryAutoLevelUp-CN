@@ -187,6 +187,10 @@ class KeyBoardController():
         self.n_jump_sent = 0
         self.n_jump_blocked = 0
         self._t_last_block_log = 0.0
+        # 跳跃 / 增益的下一次间隔（节奏关掉时等于配置原值）
+        self._human_rng = random.Random()
+        self._jump_cd_rolled = None
+        self._buff_need = [0.0] * len(self.cfg["buff_skill"]["keys"])
         # Parameters
         self.fps_limit = self.cfg["system"]["fps_limit_keyboard_controller"]
 
@@ -390,6 +394,28 @@ class KeyBoardController():
         return cd * random.uniform(1.0 - self.PICKUP_JITTER,
                                    1.0 + self.PICKUP_JITTER)
 
+    def _human_params(self):
+        from src.utils.humanize import params
+        return params(self.cfg)
+
+    def _roll_timed_cd(self, base, ratio, min_scale=0.0):
+        '''节奏开着就抖动，关着就返回配置原值。'''
+        from src.utils.humanize import jitter_interval
+        p = self._human_params()
+        if not p.get("enable"):
+            try:
+                return float(base)
+            except (TypeError, ValueError):
+                return 0.0
+        return jitter_interval(base, ratio, self._human_rng, min_scale=min_scale)
+
+    def _roll_jump_cd(self, base):
+        self._jump_cd_rolled = self._roll_timed_cd(
+            base, self._human_params()["jump_jitter"], min_scale=0.9)
+
+    def _roll_buff_cd(self, base):
+        return self._roll_timed_cd(base, self._human_params()["buff_jitter"])
+
     def _try_pickup(self, now):
         '''
         到了拾取时间点就点一次拾取键，并排下一次。
@@ -480,13 +506,15 @@ class KeyBoardController():
             # Buff skill
             for i, buff_skill_key in enumerate(self.cfg["buff_skill"]["keys"]):
                 cooldown = self.cfg["buff_skill"]["cooldown"][i]
-                if time.time() - self.t_last_buff_cast[i] >= cooldown and \
+                need = self._buff_need[i] or cooldown
+                if time.time() - self.t_last_buff_cast[i] >= need and \
                     time.time() - self.t_last_skill > self.cfg["buff_skill"]["action_cooldown"]:
                     self._press(buff_skill_key)
                     logger.info(f"[Buff] Press buff skill key: '{buff_skill_key}' (cooldown: {cooldown}s)")
                     # Reset timers
                     self.t_last_buff_cast[i] = time.time()
                     self.t_last_skill = time.time()
+                    self._buff_need[i] = self._roll_buff_cd(cooldown)
                     break
 
             ##########################
@@ -549,9 +577,12 @@ class KeyBoardController():
                                                          DEFAULT_JUMP_COOLDOWN))
                 except (TypeError, ValueError):
                     _jump_cd = DEFAULT_JUMP_COOLDOWN
+                # 节奏开着时，这一跳用的是上次按下后抽出来的间隔，不会短于九成。
+                # 还没抽过就用配置原值，第一次跳跃不会被挡住。
+                _jump_need = getattr(self, "_jump_cd_rolled", None) or _jump_cd
                 # "该不该发"这个判断已抽成模块级纯函数 jump_ready（离线可测，
                 # 见 tools/verify_jump_cooldown.py）—— 这里只负责读配置 + 发键。
-                if jump_ready(self.t_last_jump, cooldown=_jump_cd):
+                if jump_ready(self.t_last_jump, cooldown=_jump_need):
                     # ⚠️ `self.t_last_jump = time.time()` 这行**必须保持原样写法**：
                     #    tools/verify_jump_cooldown.py 用 inspect.getsource 反向钉住了它
                     #    （防有人把更新删掉 → 冷却永远不生效 → 连跳复发）。
@@ -559,6 +590,7 @@ class KeyBoardController():
                     _prev_jump = self.t_last_jump
                     self._press(self.cfg["key"]["jump"])
                     self.t_last_jump = time.time()
+                    self._roll_jump_cd(_jump_cd)
                     _dt = self.t_last_jump - _prev_jump
                     # ── 埋点①：真的按下去了（区分 B / C 的关键一行）───────
                     self.n_jump_sent += 1
